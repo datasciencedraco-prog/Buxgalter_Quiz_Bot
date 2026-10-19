@@ -77,7 +77,22 @@ async def main():
 
     # Automatically ensure ADMIN_ID is in approved users if configured
     if settings.ADMIN_ID:
-        storage.approve_user(settings.ADMIN_ID, username="admin", full_name="Bot Administrator")
+        try:
+            storage.approve_user(settings.ADMIN_ID, username="admin", full_name="Bot Administrator")
+        except Exception as e:
+            logger.error(f"Failed to auto-approve admin {settings.ADMIN_ID}: {e}")
+
+    # If question bank is empty and sample_quiz.docx exists, auto-load questions
+    try:
+        if storage.get_questions_count() == 0 and os.path.exists("sample_quiz.docx"):
+            from parser import parse_docx
+            logger.info("Question bank is empty. Auto-loading questions from sample_quiz.docx...")
+            doc_questions = parse_docx("sample_quiz.docx")
+            if doc_questions:
+                storage.save_questions(doc_questions)
+                logger.info(f"Loaded {len(doc_questions)} questions from sample_quiz.docx.")
+    except Exception as e:
+        logger.warning(f"Could not auto-populate questions from sample_quiz.docx: {e}")
 
     logger.info(f"Bot started. Question bank count: {storage.get_questions_count()}")
     try:

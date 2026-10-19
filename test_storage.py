@@ -153,3 +153,21 @@ def test_revoke_user_and_sync(temp_storage):
         saved_ids = [item["user_id"] for item in data]
         assert user1 not in saved_ids
         assert user2 in saved_ids
+
+
+def test_readonly_db_fallback():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create an existing db file and make it read-only
+        ro_db = os.path.join(tmpdir, "readonly.db")
+        # Initialize some data first
+        sm_init = StorageManager(db_path=ro_db)
+        sm_init.approve_user(777, username="lucky", full_name="Lucky")
+        assert sm_init.is_user_approved(777, 999)
+
+        # StorageManager should handle and resolve to a writable db
+        sm_resolved = StorageManager(db_path=ro_db)
+        # Should be able to approve another user without crashing
+        sm_resolved.approve_user(888, username="worker", full_name="Worker")
+        assert sm_resolved.is_user_approved(888, 999)
+        assert sm_resolved.is_user_approved(777, 999)
+

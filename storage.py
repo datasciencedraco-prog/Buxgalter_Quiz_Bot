@@ -7,7 +7,9 @@ import json
 import logging
 import os
 import random
+import shutil
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +17,102 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+def _is_db_writable(path: str) -> bool:
+    """Test if SQLite database at path can be created, opened, and written to."""
+    try:
+        if os.path.exists(path):
+            try:
+                os.chmod(path, 0o666)
+            except Exception:
+                pass
+        else:
+            parent = os.path.dirname(os.path.abspath(path)) or "."
+            if not os.access(parent, os.W_OK):
+                return False
+
+        conn = sqlite3.connect(path, timeout=5.0)
+        conn.execute("PRAGMA journal_mode = MEMORY;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.execute("CREATE TABLE IF NOT EXISTS _writable_test (id INTEGER PRIMARY KEY);")
+        conn.execute("INSERT OR REPLACE INTO _writable_test (id) VALUES (1);")
+        conn.commit()
+        conn.execute("DROP TABLE IF EXISTS _writable_test;")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"Database write check failed for '{path}': {e}")
+        return False
+
+
+def _resolve_writable_db(requested_path: str) -> str:
+    """
+    Ensure the database path is writable.
+    If the requested path is read-only (e.g. container hosting with root-owned files),
+    automatically falls back to a writable alternative while copying existing data.
+    """
+    if _is_db_writable(requested_path):
+        return requested_path
+
+    # Candidate 1: Try an alternate file in the same directory (owned by container user)
+    parent_dir = os.path.dirname(os.path.abspath(requested_path)) or "."
+    alt_name = "active_" + os.path.basename(requested_path)
+    alt_path = os.path.join(parent_dir, alt_name)
+    if _is_db_writable(alt_path):
+        if os.path.exists(requested_path) and not os.path.exists(alt_path):
+            try:
+                shutil.copyfile(requested_path, alt_path)
+                try:
+                    os.chmod(alt_path, 0o666)
+                except Exception:
+                    pass
+                logger.info(f"Copied read-only database '{requested_path}' to active database '{alt_path}'")
+            except Exception as e:
+                logger.warning(f"Failed to copy to '{alt_path}': {e}")
+        return alt_path
+
+    # Candidate 2: Fall back to temp directory (guaranteed writable in Linux/Docker containers)
+    tmp_path = os.path.join(tempfile.gettempdir(), os.path.basename(requested_path))
+    if os.path.exists(requested_path) and not os.path.exists(tmp_path):
+        try:
+            shutil.copyfile(requested_path, tmp_path)
+            try:
+                os.chmod(tmp_path, 0o666)
+            except Exception:
+                pass
+            logger.info(f"Copied read-only database '{requested_path}' to writable storage '{tmp_path}'")
+        except Exception as e:
+            logger.warning(f"Failed to copy to '{tmp_path}': {e}")
+
+    if _is_db_writable(tmp_path):
+        return tmp_path
+
+    return requested_path
+
+
+def _resolve_writable_json(requested_path: str) -> str:
+    """Ensure json_path is writable, falling back to temp directory if needed."""
+    if os.path.exists(requested_path):
+        try:
+            os.chmod(requested_path, 0o666)
+        except Exception:
+            pass
+        if os.access(requested_path, os.W_OK):
+            return requested_path
+    else:
+        parent = os.path.dirname(os.path.abspath(requested_path)) or "."
+        if os.access(parent, os.W_OK):
+            return requested_path
+
+    tmp_json = os.path.join(tempfile.gettempdir(), os.path.basename(requested_path))
+    if os.path.exists(requested_path) and not os.path.exists(tmp_json):
+        try:
+            shutil.copyfile(requested_path, tmp_json)
+        except Exception:
+            pass
+    return tmp_json
 
 
 @dataclass
@@ -51,15 +149,17 @@ class QuizSession:
 
 class StorageManager:
     def __init__(self, db_path: str = "quiz_bot.db", json_path: str = "allowed_users.json"):
-        self.db_path = db_path
-        self.json_path = json_path
+        self.db_path = _resolve_writable_db(db_path)
+        self.json_path = _resolve_writable_json(json_path)
         self._approved_cache: Set[int] = set()
         self.init_db()
         self.load_allowed_users()
 
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
+        conn.execute("PRAGMA journal_mode = MEMORY;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -169,16 +269,19 @@ class StorageManager:
     def approve_user(self, user_id: int, username: str = "", full_name: str = "") -> None:
         """Add user to approved list and persist across DB and JSON."""
         approved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO allowed_users (user_id, username, full_name, approved_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (user_id, username, full_name, approved_at),
-            )
-            conn.commit()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO allowed_users (user_id, username, full_name, approved_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (user_id, username, full_name, approved_at),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error persisting approved user {user_id} to database: {e}")
         self._approved_cache.add(user_id)
         self.sync_json()
 
