@@ -5,7 +5,37 @@ Initializes aiogram Bot, Dispatcher, and starts long-polling.
 
 import asyncio
 import logging
+import os
 import sys
+
+# Self-contained dependency bootstrap for containerized hosting environments (WispByte, Pterodactyl, etc.)
+PACKAGES_DIR = "/tmp/packages"
+if os.path.exists(PACKAGES_DIR) and PACKAGES_DIR not in sys.path:
+    sys.path.insert(0, PACKAGES_DIR)
+
+try:
+    import aiogram
+    import docx
+    import pydantic_settings
+except ImportError:
+    import subprocess
+    print("[BOOTSTRAP] Missing dependencies detected. Installing to /tmp/packages...")
+    os.makedirs(PACKAGES_DIR, exist_ok=True)
+    if PACKAGES_DIR not in sys.path:
+        sys.path.insert(0, PACKAGES_DIR)
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--target",
+        PACKAGES_DIR,
+        "--no-cache-dir",
+        "aiogram>=3.4.0",
+        "python-docx>=1.1.0",
+        "pydantic-settings>=2.2.0",
+    ])
+    print("[BOOTSTRAP] Dependencies successfully installed!")
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
